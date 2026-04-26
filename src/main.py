@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import os
 import random
 import sys
+import time
 from dataclasses import dataclass, field
+from typing import Any
+
+sys.path.insert(0, os.path.dirname(__file__))
 
 try:
     import pygame
 except KeyboardInterrupt:
     raise SystemExit(0)
+
+from multiplayer import MultiplayerClient, MultiplayerServerHandle, payload_to_ship_sets, start_multiplayer_server
 
 
 WINDOW_WIDTH = 960
@@ -118,6 +125,135 @@ class MenuOption:
     label: str
 
 
+@dataclass
+class TextInput:
+    rect: pygame.Rect
+    text: str = ""
+    placeholder: str = ""
+    is_active: bool = False
+    max_length: int = 128
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self.is_active = self.rect.collidepoint(event.pos)
+            return self.is_active
+
+        if event.type != pygame.KEYDOWN or not self.is_active:
+            return False
+
+        if event.key == pygame.K_BACKSPACE:
+            self.text = self.text[:-1]
+            return True
+
+        if event.key in {pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_TAB}:
+            return False
+
+        if event.unicode and event.unicode.isprintable() and len(self.text) < self.max_length:
+            self.text += event.unicode
+            return True
+
+        return False
+
+    def draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
+        fill_color = (45, 63, 88) if self.is_active else (35, 50, 72)
+        pygame.draw.rect(screen, fill_color, self.rect, border_radius=10)
+        pygame.draw.rect(screen, OUTLINE_COLOR, self.rect, width=2, border_radius=10)
+
+        display_text = self.text.strip() if self.text.strip() else self.placeholder
+        text_color = TEXT_COLOR if self.text.strip() else SUBTEXT_COLOR
+        text_surface = font.render(display_text, True, text_color)
+        text_rect = text_surface.get_rect(midleft=(self.rect.x + 14, self.rect.centery))
+        screen.blit(text_surface, text_rect)
+
+
+def player_index_from_role(role: str | None) -> int | None:
+    if role == "host":
+        return 1
+    if role == "client":
+        return 2
+    return None
+
+
+def build_battle_state_from_snapshot(snapshot: dict[str, Any]) -> BattleState:
+    players = {
+        1: BattlePlayerState(
+            ships=payload_to_ship_sets(snapshot.get("host_ships", [])),
+            hits={(row, col) for row, col in snapshot.get("host_hits", [])},
+            misses={(row, col) for row, col in snapshot.get("host_misses", [])},
+        ),
+        2: BattlePlayerState(
+            ships=payload_to_ship_sets(snapshot.get("client_ships", [])),
+            hits={(row, col) for row, col in snapshot.get("client_hits", [])},
+            misses={(row, col) for row, col in snapshot.get("client_misses", [])},
+        ),
+    }
+    current_player_index = player_index_from_role(snapshot.get("turn_role")) or 1
+    winner_index = player_index_from_role(snapshot.get("winner_role"))
+    message = snapshot.get("message", "")
+    return BattleState(players=players, current_player_index=current_player_index, winner_index=winner_index, message=message)
+
+
+def empty_multiplayer_setup_state() -> PlayerSetupState:
+    return create_player_setup_state()
+
+
+def grid_cell_rect(origin_x: int, origin_y: int, row: int, col: int) -> pygame.Rect:
+    return pygame.Rect(origin_x + col * CELL_SIZE, origin_y + row * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+
+
+def draw_grid_labels(screen: pygame.Surface, font: pygame.font.Font, origin_x: int, origin_y: int, x_offset: int, y_offset: int) -> None:
+    for col in range(GRID_SIZE):
+        label = chr(ord("A") + col)
+        label_surface = font.render(label, True, LABEL_COLOR)
+        x = origin_x + col * CELL_SIZE + CELL_SIZE // 2
+        screen.blit(label_surface, (x - label_surface.get_width() // 2, origin_y - y_offset))
+
+    for row in range(GRID_SIZE):
+        label_surface = font.render(str(row + 1), True, LABEL_COLOR)
+        y = origin_y + row * CELL_SIZE + CELL_SIZE // 2
+        screen.blit(label_surface, (origin_x - x_offset, y - label_surface.get_height() // 2))
+
+
+def iter_ship_cells(ships: list[set[tuple[int, int]]]) -> set[tuple[int, int]]:
+    cells: set[tuple[int, int]] = set()
+    for ship in ships:
+        cells.update(ship)
+    return cells
+
+
+def ship_is_sunk(ship: set[tuple[int, int]], hits: set[tuple[int, int]]) -> bool:
+    return ship.issubset(hits)
+
+
+def adjacent_cells_around_ship(ship: set[tuple[int, int]]) -> set[tuple[int, int]]:
+    adjacent: set[tuple[int, int]] = set()
+    for row, col in ship:
+        for d_row in (-1, 0, 1):
+            for d_col in (-1, 0, 1):
+                n_row = row + d_row
+                n_col = col + d_col
+                if 0 <= n_row < GRID_SIZE and 0 <= n_col < GRID_SIZE:
+                    candidate = (n_row, n_col)
+                    if candidate not in ship:
+                        adjacent.add(candidate)
+    return adjacent
+
+
+def build_button_column(
+    items: list[tuple[str, str]],
+    x: int,
+    start_y: int,
+    width: int,
+    height: int,
+    gap: int,
+) -> list[tuple[str, Button]]:
+    buttons: list[tuple[str, Button]] = []
+    for index, (option_id, label) in enumerate(items):
+        button_rect = pygame.Rect(x, start_y + index * gap, width, height)
+        buttons.append((option_id, Button(button_rect, label)))
+    return buttons
+
+
 def create_player_setup_state() -> PlayerSetupState:
     lengths = [4, 3, 3, 2, 2, 2, 1, 1, 1, 1]
     side_positions = [
@@ -164,9 +300,21 @@ class LocalPlayMode(BaseGameMode):
         app.start_local_setup()
 
 
+class MultiplayerPlayMode(BaseGameMode):
+    mode_id = "multiplayer"
+    label = "Play Multiplayer"
+
+    def on_selected(self, app: "BattleshipMenuApp") -> None:
+        app.selected_mode_id = self.mode_id
+        app.show_multiplayer_menu()
+
+
 @dataclass
 class GameModeRegistry:
     _mode_classes: dict[str, type[BaseGameMode]] = field(default_factory=dict)
+
+    def _mode_entries(self) -> list[BaseGameMode]:
+        return list(self._mode_classes.values())
 
     def register(self, mode_cls: type[BaseGameMode]) -> None:
         if not mode_cls.mode_id:
@@ -176,7 +324,7 @@ class GameModeRegistry:
         self._mode_classes[mode_cls.mode_id] = mode_cls
 
     def options(self) -> list[ModeOption]:
-        return [ModeOption(mode_id=mode.mode_id, label=mode.label) for mode in self._mode_classes.values()]
+        return [ModeOption(mode_id=mode.mode_id, label=mode.label) for mode in self._mode_entries()]
 
     def create(self, mode_id: str) -> BaseGameMode | None:
         mode_cls = self._mode_classes.get(mode_id)
@@ -185,10 +333,13 @@ class GameModeRegistry:
         return mode_cls()
 
     def menu_options(self) -> list[MenuOption]:
-        return [MenuOption(option_id=mode.mode_id, label=mode.label) for mode in self._mode_classes.values()]
+        return [MenuOption(option_id=mode.mode_id, label=mode.label) for mode in self._mode_entries()]
 
 
 class Screen(ABC):
+    def update(self, app: "BattleshipMenuApp") -> None:
+        return
+
     @abstractmethod
     def handle_event(self, app: "BattleshipMenuApp", event: pygame.event.Event) -> None:
         pass
@@ -269,12 +420,8 @@ class ModeSelectionScreen(Screen):
             button.draw(app.screen, app.dropdown_font, mouse_pos)
 
     def _build_option_buttons(self, options: list[ModeOption]) -> list[tuple[str, Button]]:
-        buttons: list[tuple[str, Button]] = []
-        start_y = 246
-        for index, option in enumerate(options):
-            button_rect = pygame.Rect(340, start_y + index * 64, 280, 56)
-            buttons.append((option.mode_id, Button(button_rect, option.label)))
-        return buttons
+        items = [(option.mode_id, option.label) for option in options]
+        return build_button_column(items, 340, 246, 280, 56, 64)
 
 
 @dataclass
@@ -335,35 +482,16 @@ class LocalSetupScreen(Screen):
         self.next_button.draw(app.screen, app.button_font, mouse_pos)
 
     def _draw_grid(self, app: "BattleshipMenuApp", state: PlayerSetupState) -> None:
-        for col in range(GRID_SIZE):
-            label = chr(ord("A") + col)
-            label_surface = app.small_font.render(label, True, LABEL_COLOR)
-            x = GRID_ORIGIN_X + col * CELL_SIZE + CELL_SIZE // 2
-            app.screen.blit(label_surface, (x - label_surface.get_width() // 2, GRID_ORIGIN_Y - 28))
-
-        for row in range(GRID_SIZE):
-            label_surface = app.small_font.render(str(row + 1), True, LABEL_COLOR)
-            y = GRID_ORIGIN_Y + row * CELL_SIZE + CELL_SIZE // 2
-            app.screen.blit(label_surface, (GRID_ORIGIN_X - 28, y - label_surface.get_height() // 2))
+        draw_grid_labels(app.screen, app.small_font, GRID_ORIGIN_X, GRID_ORIGIN_Y, x_offset=28, y_offset=28)
 
         for row in range(GRID_SIZE):
             for col in range(GRID_SIZE):
-                rect = pygame.Rect(
-                    GRID_ORIGIN_X + col * CELL_SIZE,
-                    GRID_ORIGIN_Y + row * CELL_SIZE,
-                    CELL_SIZE,
-                    CELL_SIZE,
-                )
+                rect = grid_cell_rect(GRID_ORIGIN_X, GRID_ORIGIN_Y, row, col)
                 pygame.draw.rect(app.screen, GRID_COLOR, rect)
                 pygame.draw.rect(app.screen, OUTLINE_COLOR, rect, width=1)
 
         for row, col in state.occupied_cells:
-            rect = pygame.Rect(
-                GRID_ORIGIN_X + col * CELL_SIZE,
-                GRID_ORIGIN_Y + row * CELL_SIZE,
-                CELL_SIZE,
-                CELL_SIZE,
-            )
+            rect = grid_cell_rect(GRID_ORIGIN_X, GRID_ORIGIN_Y, row, col)
             pygame.draw.rect(app.screen, SHIP_COLOR, rect)
             pygame.draw.rect(app.screen, OUTLINE_COLOR, rect, width=1)
 
@@ -645,23 +773,13 @@ class LocalBattleScreen(Screen):
         origin_y: int,
         reveal_ships: bool,
     ) -> None:
-        for col in range(GRID_SIZE):
-            label = chr(ord("A") + col)
-            label_surface = app.hint_font.render(label, True, LABEL_COLOR)
-            x = origin_x + col * CELL_SIZE + CELL_SIZE // 2
-            app.screen.blit(label_surface, (x - label_surface.get_width() // 2, origin_y - 31))
-
-        for row in range(GRID_SIZE):
-            label_surface = app.hint_font.render(str(row + 1), True, LABEL_COLOR)
-            y = origin_y + row * CELL_SIZE + CELL_SIZE // 2
-            app.screen.blit(label_surface, (origin_x - 24, y - label_surface.get_height() // 2))
+        draw_grid_labels(app.screen, app.hint_font, origin_x, origin_y, x_offset=24, y_offset=31)
 
         ship_cells = self._all_ship_cells(player)
-        sunk_ship_cells = self._all_sunk_ship_cells(player)
         revealed_adjacent_cells = self._adjacent_cells_around_sunk_ships(player)
         for row in range(GRID_SIZE):
             for col in range(GRID_SIZE):
-                rect = pygame.Rect(origin_x + col * CELL_SIZE, origin_y + row * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+                rect = grid_cell_rect(origin_x, origin_y, row, col)
                 cell = (row, col)
                 fill_color = GRID_COLOR
                 if cell in player.misses:
@@ -692,10 +810,7 @@ class LocalBattleScreen(Screen):
         return None
 
     def _all_ship_cells(self, player: BattlePlayerState) -> set[tuple[int, int]]:
-        cells: set[tuple[int, int]] = set()
-        for ship in player.ships:
-            cells.update(ship)
-        return cells
+        return iter_ship_cells(player.ships)
 
     def _is_ship_cell(self, player: BattlePlayerState, cell: tuple[int, int]) -> bool:
         return any(cell in ship for ship in player.ships)
@@ -703,39 +818,31 @@ class LocalBattleScreen(Screen):
     def _is_sunk(self, player: BattlePlayerState, hit_cell: tuple[int, int]) -> bool:
         for ship in player.ships:
             if hit_cell in ship:
-                return ship.issubset(player.hits)
+                return ship_is_sunk(ship, player.hits)
         return False
 
     def _is_hit_on_sunk_ship(self, player: BattlePlayerState, cell: tuple[int, int]) -> bool:
         for ship in player.ships:
             if cell in ship:
-                return ship.issubset(player.hits)
+                return ship_is_sunk(ship, player.hits)
         return False
 
     def _all_ships_sunk(self, player: BattlePlayerState) -> bool:
-        return all(ship.issubset(player.hits) for ship in player.ships)
+        return all(ship_is_sunk(ship, player.hits) for ship in player.ships)
 
     def _all_sunk_ship_cells(self, player: BattlePlayerState) -> set[tuple[int, int]]:
         cells: set[tuple[int, int]] = set()
         for ship in player.ships:
-            if ship.issubset(player.hits):
+            if ship_is_sunk(ship, player.hits):
                 cells.update(ship)
         return cells
 
     def _adjacent_cells_around_sunk_ships(self, player: BattlePlayerState) -> set[tuple[int, int]]:
         adjacent: set[tuple[int, int]] = set()
         for ship in player.ships:
-            if not ship.issubset(player.hits):
+            if not ship_is_sunk(ship, player.hits):
                 continue
-            for row, col in ship:
-                for d_row in (-1, 0, 1):
-                    for d_col in (-1, 0, 1):
-                        n_row = row + d_row
-                        n_col = col + d_col
-                        if 0 <= n_row < GRID_SIZE and 0 <= n_col < GRID_SIZE:
-                            candidate = (n_row, n_col)
-                            if candidate not in ship:
-                                adjacent.add(candidate)
+            adjacent.update(adjacent_cells_around_ship(ship))
         return adjacent
 
 
@@ -783,11 +890,275 @@ class WinnerMenuScreen(Screen):
         self.exit_button.draw(app.screen, app.button_font, mouse_pos)
 
     def _build_option_buttons(self, options: list[MenuOption]) -> list[tuple[str, Button]]:
-        buttons: list[tuple[str, Button]] = []
-        for index, option in enumerate(options):
-            button_rect = pygame.Rect(320, 320 + index * 56, 320, 46)
-            buttons.append((option.option_id, Button(button_rect, option.label)))
-        return buttons
+        items = [(option.option_id, option.label) for option in options]
+        return build_button_column(items, 320, 320, 320, 46, 56)
+
+
+@dataclass
+class MultiplayerMenuScreen(Screen):
+    host_button: Button = field(default_factory=lambda: Button(pygame.Rect(320, 250, 320, 68), "Host Game"))
+    join_button: Button = field(default_factory=lambda: Button(pygame.Rect(320, 340, 320, 68), "Join Game"))
+    back_button: Button = field(default_factory=lambda: Button(pygame.Rect(320, 430, 320, 68), "Back"))
+
+    def handle_event(self, app: "BattleshipMenuApp", event: pygame.event.Event) -> None:
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return
+
+        if self.host_button.clicked(event.pos):
+            app.start_multiplayer_host()
+            return
+
+        if self.join_button.clicked(event.pos):
+            app.show_multiplayer_join()
+            return
+
+        if self.back_button.clicked(event.pos):
+            app.show_main_menu()
+
+    def draw(self, app: "BattleshipMenuApp") -> None:
+        app.draw_frame("Multiplayer")
+        mouse_pos = pygame.mouse.get_pos()
+        info = app.hint_font.render("Host starts a local server. Join connects to it.", True, LABEL_COLOR)
+        app.screen.blit(info, (WINDOW_WIDTH // 2 - info.get_width() // 2, 210))
+        self.host_button.draw(app.screen, app.button_font, mouse_pos)
+        self.join_button.draw(app.screen, app.button_font, mouse_pos)
+        self.back_button.draw(app.screen, app.button_font, mouse_pos)
+
+
+@dataclass
+class MultiplayerJoinScreen(Screen):
+    address_input: TextInput = field(
+        default_factory=lambda: TextInput(
+            pygame.Rect(250, 270, 460, 48),
+            text="127.0.0.1:8765",
+            placeholder="http://127.0.0.1:8765",
+            is_active=True,
+        )
+    )
+    connect_button: Button = field(default_factory=lambda: Button(pygame.Rect(360, 340, 240, 56), "Connect"))
+    back_button: Button = field(default_factory=lambda: Button(pygame.Rect(360, 410, 240, 56), "Back"))
+
+    def handle_event(self, app: "BattleshipMenuApp", event: pygame.event.Event) -> None:
+        handled_text = self.address_input.handle_event(event)
+        if event.type == pygame.KEYDOWN and event.key in {pygame.K_RETURN, pygame.K_KP_ENTER} and self.address_input.is_active:
+            self._connect(app)
+            return
+
+        if handled_text:
+            return
+
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return
+
+        if self.connect_button.clicked(event.pos):
+            self._connect(app)
+            return
+
+        if self.back_button.clicked(event.pos):
+            app.show_multiplayer_menu()
+
+    def draw(self, app: "BattleshipMenuApp") -> None:
+        app.draw_frame("Join Multiplayer")
+        mouse_pos = pygame.mouse.get_pos()
+
+        prompt = app.hint_font.render("Enter host address, for example 127.0.0.1:8765", True, LABEL_COLOR)
+        app.screen.blit(prompt, (WINDOW_WIDTH // 2 - prompt.get_width() // 2, 220))
+        self.address_input.draw(app.screen, app.button_font)
+        self.connect_button.draw(app.screen, app.button_font, mouse_pos)
+        self.back_button.draw(app.screen, app.button_font, mouse_pos)
+
+        if app.multiplayer_status_message:
+            status = app.hint_font.render(app.multiplayer_status_message, True, SUBTEXT_COLOR)
+            app.screen.blit(status, (WINDOW_WIDTH // 2 - status.get_width() // 2, 480))
+
+    def _connect(self, app: "BattleshipMenuApp") -> None:
+        app.start_multiplayer_join(self.address_input.text)
+
+
+@dataclass
+class MultiplayerHostWaitScreen(Screen):
+    back_button: Button = field(default_factory=lambda: Button(pygame.Rect(360, 480, 240, 56), "Back"))
+
+    def update(self, app: "BattleshipMenuApp") -> None:
+        app.sync_multiplayer_lobby()
+
+    def handle_event(self, app: "BattleshipMenuApp", event: pygame.event.Event) -> None:
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return
+
+        if self.back_button.clicked(event.pos):
+            app.stop_multiplayer_session()
+            app.show_main_menu()
+
+    def draw(self, app: "BattleshipMenuApp") -> None:
+        app.draw_frame("Hosting Multiplayer")
+        mouse_pos = pygame.mouse.get_pos()
+
+        host_url = app.multiplayer_server.advertised_url if app.multiplayer_server is not None else ""
+        host_url_surface = app.button_font.render(host_url, True, TEXT_COLOR)
+        app.screen.blit(host_url_surface, (WINDOW_WIDTH // 2 - host_url_surface.get_width() // 2, 250))
+
+        waiting_text = app.hint_font.render("Waiting for client connection...", True, LABEL_COLOR)
+        app.screen.blit(waiting_text, (WINDOW_WIDTH // 2 - waiting_text.get_width() // 2, 320))
+
+        if app.multiplayer_status_message:
+            status = app.hint_font.render(app.multiplayer_status_message, True, SUBTEXT_COLOR)
+            app.screen.blit(status, (WINDOW_WIDTH // 2 - status.get_width() // 2, 360))
+
+        self.back_button.draw(app.screen, app.button_font, mouse_pos)
+
+
+@dataclass
+class MultiplayerSetupScreen(LocalSetupScreen):
+    def __post_init__(self) -> None:
+        self.next_button.label = "Ready"
+
+    def update(self, app: "BattleshipMenuApp") -> None:
+        app.sync_multiplayer_setup()
+
+    def handle_event(self, app: "BattleshipMenuApp", event: pygame.event.Event) -> None:
+        state = app.multiplayer_setup_state
+        if state is None:
+            return
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.auto_place_button.clicked(event.pos):
+                self._auto_place_ships(state)
+                return
+            if self.next_button.clicked(event.pos):
+                if self._all_ships_placed(state):
+                    app.submit_multiplayer_setup()
+                else:
+                    app.multiplayer_status_message = "Place all ships before sending your field"
+                return
+            self._start_drag(state, event.pos)
+            return
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+            self._rotate_ship_at(state, event.pos)
+            return
+
+        if event.type == pygame.MOUSEMOTION:
+            self._update_drag(state, event.pos)
+            return
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._drop_drag(state)
+
+    def draw(self, app: "BattleshipMenuApp") -> None:
+        state = app.multiplayer_setup_state
+        if state is None:
+            app.show_multiplayer_menu()
+            return
+
+        app.screen.fill(BG_COLOR)
+
+        subtitle = app.subtitle_font.render("Multiplayer Setup", True, SUBTEXT_COLOR)
+        app.screen.blit(subtitle, (WINDOW_WIDTH // 2 - subtitle.get_width() // 2, 24))
+
+        board_panel = pygame.Rect(140, 110, 430, 390)
+        ships_panel = pygame.Rect(590, 110, 230, 390)
+        pygame.draw.rect(app.screen, PANEL_COLOR, board_panel, border_radius=12)
+        pygame.draw.rect(app.screen, OUTLINE_COLOR, board_panel, width=2, border_radius=12)
+        pygame.draw.rect(app.screen, SHIP_AREA_COLOR, ships_panel, border_radius=12)
+        pygame.draw.rect(app.screen, OUTLINE_COLOR, ships_panel, width=2, border_radius=12)
+
+        ships_title = app.small_font.render("Your Ships", True, LABEL_COLOR)
+        app.screen.blit(ships_title, (ships_panel.centerx - ships_title.get_width() // 2, 126))
+
+        self._draw_grid(app, state)
+        self._draw_ships(app, state)
+
+        status_text = app.multiplayer_status_message or "Rotate ships with right click"
+        status = app.hint_font.render(status_text, True, LABEL_COLOR)
+        app.screen.blit(status, (WINDOW_WIDTH // 2 - status.get_width() // 2, 78))
+
+        mouse_pos = pygame.mouse.get_pos()
+        self.auto_place_button.draw(app.screen, app.dropdown_font, mouse_pos)
+        self.next_button.draw(app.screen, app.button_font, mouse_pos)
+
+
+@dataclass
+class MultiplayerBattleScreen(LocalBattleScreen):
+    def update(self, app: "BattleshipMenuApp") -> None:
+        app.sync_multiplayer_battle()
+
+    def handle_event(self, app: "BattleshipMenuApp", event: pygame.event.Event) -> None:
+        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
+            return
+
+        if self.back_button.clicked(event.pos):
+            app.stop_multiplayer_session()
+            app.show_main_menu()
+            return
+
+        battle = app.battle_state
+        if battle is None or battle.winner_index is not None or app.multiplayer_role is None:
+            return
+
+        local_player_index = player_index_from_role(app.multiplayer_role)
+        if local_player_index is None:
+            return
+
+        if battle.current_player_index != local_player_index:
+            battle.message = "Waiting for opponent turn"
+            return
+
+        target_player_index = 2 if local_player_index == 1 else 1
+        target_origin_x = BATTLE_RIGHT_GRID_X if target_player_index == 2 else BATTLE_LEFT_GRID_X
+        cell = self._pixel_to_grid_cell(event.pos, target_origin_x, BATTLE_GRID_Y)
+        if cell is None:
+            battle.message = "Click on the enemy field"
+            return
+
+        target = battle.players[target_player_index]
+        if cell in target.hits or cell in target.misses:
+            battle.message = "Cell already targeted"
+            return
+
+        if cell in self._adjacent_cells_around_sunk_ships(target):
+            battle.message = "Cell blocked"
+            return
+
+        app.submit_multiplayer_shot(cell)
+
+    def draw(self, app: "BattleshipMenuApp") -> None:
+        battle = app.battle_state
+        if battle is None:
+            app.show_main_menu()
+            return
+
+        local_player_index = player_index_from_role(app.multiplayer_role)
+        if local_player_index is None:
+            app.show_main_menu()
+            return
+
+        opponent_player_index = 2 if local_player_index == 1 else 1
+
+        app.screen.fill(BG_COLOR)
+
+        if battle.winner_index is None:
+            turn_text = "Your turn" if battle.current_player_index == local_player_index else "Waiting for opponent"
+        else:
+            turn_text = f"Winner: Player {battle.winner_index}"
+
+        turn_surface = app.title_font.render(turn_text, True, TEXT_COLOR)
+        message = app.hint_font.render(battle.message, True, LABEL_COLOR)
+        app.screen.blit(turn_surface, (WINDOW_WIDTH // 2 - turn_surface.get_width() // 2, 24))
+        app.screen.blit(message, (WINDOW_WIDTH // 2 - message.get_width() // 2, 84))
+
+        own_origin_x = BATTLE_LEFT_GRID_X if local_player_index == 1 else BATTLE_RIGHT_GRID_X
+        enemy_origin_x = BATTLE_RIGHT_GRID_X if local_player_index == 1 else BATTLE_LEFT_GRID_X
+        own_label = app.hint_font.render("Your Field", True, LABEL_COLOR)
+        enemy_label = app.hint_font.render("Enemy Field", True, LABEL_COLOR)
+        app.screen.blit(own_label, (own_origin_x, 505))
+        app.screen.blit(enemy_label, (enemy_origin_x, 505))
+
+        self._draw_battle_grid(app, battle.players[local_player_index], own_origin_x, BATTLE_GRID_Y, reveal_ships=True)
+        self._draw_battle_grid(app, battle.players[opponent_player_index], enemy_origin_x, BATTLE_GRID_Y, reveal_ships=False)
+
+        mouse_pos = pygame.mouse.get_pos()
+        self.back_button.draw(app.screen, app.hint_font, mouse_pos)
 
 
 class BattleshipMenuApp:
@@ -813,20 +1184,176 @@ class BattleshipMenuApp:
             2: create_player_setup_state(),
         }
         self.battle_state: BattleState | None = None
+        self.multiplayer_server: MultiplayerServerHandle | None = None
+        self.multiplayer_client: MultiplayerClient | None = None
+        self.multiplayer_role: str | None = None
+        self.multiplayer_setup_state: PlayerSetupState | None = None
+        self.multiplayer_status_message: str = ""
+        self._last_multiplayer_sync_at = 0.0
 
         self.main_menu_screen = MainMenuScreen()
         self.mode_selection_screen = ModeSelectionScreen()
         self.local_setup_screen = LocalSetupScreen()
         self.local_battle_screen = LocalBattleScreen()
         self.winner_menu_screen = WinnerMenuScreen()
+        self.multiplayer_menu_screen = MultiplayerMenuScreen()
+        self.multiplayer_join_screen = MultiplayerJoinScreen()
+        self.multiplayer_host_wait_screen = MultiplayerHostWaitScreen()
+        self.multiplayer_setup_screen = MultiplayerSetupScreen()
+        self.multiplayer_battle_screen = MultiplayerBattleScreen()
         self.current_screen: Screen = self.main_menu_screen
         self.running = True
 
     def register_mode(self, mode_cls: type[BaseGameMode]) -> None:
         self.mode_registry.register(mode_cls)
 
+    def stop_multiplayer_session(self) -> None:
+        if self.multiplayer_client is not None:
+            self.multiplayer_client.close()
+            self.multiplayer_client = None
+        if self.multiplayer_server is not None:
+            self.multiplayer_server.close()
+            self.multiplayer_server = None
+        self.multiplayer_role = None
+        self.multiplayer_setup_state = None
+        self.multiplayer_status_message = ""
+        self._last_multiplayer_sync_at = 0.0
+
+    def show_multiplayer_menu(self) -> None:
+        self.dropdown_open = False
+        self.stop_multiplayer_session()
+        self.current_screen = self.multiplayer_menu_screen
+
+    def show_multiplayer_join(self) -> None:
+        self.dropdown_open = False
+        self.stop_multiplayer_session()
+        self.current_screen = self.multiplayer_join_screen
+
+    def start_multiplayer_host(self) -> None:
+        self.stop_multiplayer_session()
+        try:
+            self.multiplayer_server = start_multiplayer_server()
+            self.multiplayer_client = MultiplayerClient(self.multiplayer_server.base_url)
+            self.multiplayer_role = "host"
+            self.multiplayer_setup_state = empty_multiplayer_setup_state()
+            self.battle_state = None
+            self.multiplayer_status_message = "Server started. Waiting for client to join"
+            self.current_screen = self.multiplayer_host_wait_screen
+            snapshot: dict[str, Any] | None = None
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                try:
+                    snapshot = self.multiplayer_client.state()
+                    break
+                except Exception:  # noqa: BLE001
+                    time.sleep(0.05)
+            if snapshot is not None:
+                self._sync_multiplayer_snapshot(snapshot)
+        except Exception as exc:  # noqa: BLE001
+            self.multiplayer_status_message = f"Failed to start host session: {exc}"
+            self.stop_multiplayer_session()
+            self.current_screen = self.multiplayer_menu_screen
+
+    def start_multiplayer_join(self, base_url: str) -> None:
+        self.stop_multiplayer_session()
+        try:
+            self.multiplayer_client = MultiplayerClient(base_url)
+            self.multiplayer_client.join()
+            self.multiplayer_role = "client"
+            self.multiplayer_setup_state = empty_multiplayer_setup_state()
+            self.battle_state = None
+            self.multiplayer_status_message = "Connected. Place your ships"
+            self.current_screen = self.multiplayer_setup_screen
+            self._sync_multiplayer_snapshot(self.multiplayer_client.state())
+        except Exception as exc:  # noqa: BLE001
+            self.multiplayer_status_message = f"Connection failed: {exc}"
+            if self.multiplayer_client is not None:
+                self.multiplayer_client.close()
+                self.multiplayer_client = None
+            self.multiplayer_role = None
+            self.current_screen = self.multiplayer_join_screen
+
+    def submit_multiplayer_setup(self) -> None:
+        if self.multiplayer_client is None or self.multiplayer_role is None or self.multiplayer_setup_state is None:
+            return
+
+        ships = [set(ship.placed_cells or ()) for ship in self.multiplayer_setup_state.ships if ship.placed_cells is not None]
+        try:
+            snapshot = self.multiplayer_client.submit_setup(self.multiplayer_role, ships)
+            self._sync_multiplayer_snapshot(snapshot)
+        except Exception as exc:  # noqa: BLE001
+            self.multiplayer_status_message = f"Failed to submit setup: {exc}"
+
+    def submit_multiplayer_shot(self, cell: tuple[int, int]) -> None:
+        if self.multiplayer_client is None or self.multiplayer_role is None:
+            return
+
+        try:
+            snapshot = self.multiplayer_client.submit_shot(self.multiplayer_role, cell[0], cell[1])
+            self._sync_multiplayer_snapshot(snapshot)
+            if self.battle_state is not None and self.battle_state.winner_index is not None:
+                self.show_winner_menu(self.battle_state.winner_index)
+        except Exception as exc:  # noqa: BLE001
+            if self.battle_state is not None:
+                self.battle_state.message = f"Shot failed: {exc}"
+
+    def sync_multiplayer_lobby(self) -> None:
+        if not self._should_poll_multiplayer():
+            return
+        snapshot = self._fetch_multiplayer_snapshot()
+        if snapshot is None:
+            return
+        self._sync_multiplayer_snapshot(snapshot)
+        if snapshot.get("client_connected"):
+            self.multiplayer_status_message = snapshot.get("message", self.multiplayer_status_message)
+            if snapshot.get("phase") in {"setup", "battle", "finished"}:
+                self.current_screen = self.multiplayer_setup_screen
+
+    def sync_multiplayer_setup(self) -> None:
+        if not self._should_poll_multiplayer():
+            return
+        snapshot = self._fetch_multiplayer_snapshot()
+        if snapshot is None:
+            return
+        self._sync_multiplayer_snapshot(snapshot)
+        if snapshot.get("phase") == "battle":
+            self.current_screen = self.multiplayer_battle_screen
+
+    def sync_multiplayer_battle(self) -> None:
+        if not self._should_poll_multiplayer():
+            return
+        snapshot = self._fetch_multiplayer_snapshot()
+        if snapshot is None:
+            return
+        self._sync_multiplayer_snapshot(snapshot)
+        if self.battle_state is not None and self.battle_state.winner_index is not None:
+            self.show_winner_menu(self.battle_state.winner_index)
+
+    def _fetch_multiplayer_snapshot(self) -> dict[str, Any] | None:
+        if self.multiplayer_client is None:
+            return None
+        try:
+            return self.multiplayer_client.state()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _should_poll_multiplayer(self) -> bool:
+        now = time.monotonic()
+        if now - self._last_multiplayer_sync_at < 0.25:
+            return False
+        self._last_multiplayer_sync_at = now
+        return True
+
+    def _sync_multiplayer_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self.multiplayer_status_message = snapshot.get("message", self.multiplayer_status_message)
+        if snapshot.get("phase") in {"setup", "battle", "finished"}:
+            self.battle_state = build_battle_state_from_snapshot(snapshot)
+        if snapshot.get("phase") == "finished" and self.battle_state is not None and self.battle_state.winner_index is not None:
+            self.current_screen = self.winner_menu_screen
+
     def show_main_menu(self) -> None:
         self.dropdown_open = False
+        self.stop_multiplayer_session()
         self.battle_state = None
         self.current_screen = self.main_menu_screen
 
@@ -838,10 +1365,12 @@ class BattleshipMenuApp:
 
     def show_mode_selection(self) -> None:
         self.dropdown_open = False
+        self.stop_multiplayer_session()
         self.current_screen = self.mode_selection_screen
 
     def start_local_setup(self) -> None:
         self.dropdown_open = False
+        self.stop_multiplayer_session()
         self.battle_state = None
         self.setup_player_index = 1
         self.player_setup_states = {
@@ -898,11 +1427,13 @@ class BattleshipMenuApp:
                     else:
                         self.current_screen.handle_event(self, event)
 
+                self.current_screen.update(self)
                 self.current_screen.draw(self)
                 pygame.display.flip()
         except KeyboardInterrupt:
             self.running = False
         finally:
+            self.stop_multiplayer_session()
             pygame.quit()
             sys.exit(0)
 
@@ -910,6 +1441,7 @@ class BattleshipMenuApp:
 def main() -> None:
     app = BattleshipMenuApp()
     app.register_mode(LocalPlayMode)
+    app.register_mode(MultiplayerPlayMode)
     app.run()
 
 
